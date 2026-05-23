@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `scripts/capture_session.py` — capture a live, human-authenticated HEB session
+  (cookies + localStorage, incl. the `reese84` anti-bot token) from a real Chrome
+  started with `--remote-debugging-port`, into Playwright `storageState` JSON. This
+  is the reliable recovery when HEB's anti-bot blocks automated/headless re-login.
+
+### Changed
+- `session_save_instructions` now documents the **real-Chrome CDP recapture** flow
+  instead of the Playwright-MCP `browser_navigate`/`browser_run_code` flow (which
+  HEB's reese84/Incapsula anti-bot blocks — you can't complete a human login in an
+  automated browser).
+
+### Fixed
+- **Account-mismatch guard:** `session_refresh` no longer auto-logs-in with stored
+  credentials when they belong to a *different* account than the saved session.
+  Previously a mismatched auto-login that happened to succeed would overwrite the
+  existing account's `auth.json` with the wrong account's session. Added
+  `get_session_account_email()` (reads the `loginEmail` cookie) and a guard that
+  returns an `account_mismatch` error instead of clobbering the session.
+- **Headed auto-refresh (`auto_refresh_headless`):** the background session
+  auto-refresh hardcoded `headless=True`. HEB's Incapsula anti-bot returns HTTP
+  401 to the *headless* refresh browser, so it could never renew the reese84
+  token and the session silently died (every tool call then failed with "login
+  required"). New `auto_refresh_headless` setting (env `AUTO_REFRESH_HEADLESS`,
+  default `true` for compatibility) — set it `false` where a virtual display is
+  available (e.g. `xvfb` in a container) to refresh via a headed browser that
+  passes the anti-bot, keeping the session self-sustaining. When headed mode
+  hits a fully-expired session it now cleans up the handoff browser and returns
+  `LOGIN_REQUIRED` instead of leaving it hanging.
+
 ## [0.1.2] - 2026-02-02
 
 ### Changed

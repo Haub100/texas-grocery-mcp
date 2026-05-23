@@ -6,6 +6,7 @@ Provides cookie conversion for httpx-based API requests.
 
 import json
 import time
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -488,6 +489,37 @@ def get_session_info() -> dict[str, Any]:
     return info
 
 
+def get_session_account_email() -> str | None:
+    """Return the HEB account email of the saved session, if discoverable.
+
+    HEB stores the logged-in email in the ``loginEmail`` cookie (URL-encoded).
+    This is used to guard against an auto-login overwriting one account's saved
+    session with a different account's credentials (see the auto-login flow in
+    ``tools.session.session_refresh``).
+
+    Returns:
+        The lowercased account email, or None if no session / cookie is found.
+    """
+    settings = get_settings()
+    auth_path = settings.auth_state_path
+
+    if not auth_path.exists():
+        return None
+
+    try:
+        with open(auth_path) as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    for cookie in state.get("cookies", []):
+        if cookie.get("name") == "loginEmail" and "heb.com" in cookie.get("domain", ""):
+            value = urllib.parse.unquote(cookie.get("value", "")).strip()
+            return value.lower() or None
+
+    return None
+
+
 # Refresh threshold: recommend refresh when less than this many hours remain
 SESSION_REFRESH_THRESHOLD_HOURS = 4
 
@@ -702,13 +734,31 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
 
         result = await refresh_session_with_browser(
             auth_path=auth_path,
-            headless=True,
+            headless=settings.auto_refresh_headless,
             timeout=30000,
         )
 
+        # In headed mode a fully-expired session returns a human-handoff dict
+        # instead of raising LoginRequiredError (it opens a login page). Don't
+        # leave that browser hanging in a non-interactive context — clean up and
+        # surface a clear "manual re-capture" error.
+        if isinstance(result, dict) and result.get("status") == "human_action_required":
+            from texas_grocery_mcp.auth.browser_refresh import clear_pending_login
+
+            clear_pending_login()
+            return {
+                "error": True,
+                "code": "LOGIN_REQUIRED",
+                "message": (
+                    "Your HEB session has fully expired and needs a manual "
+                    "re-capture. See session_save_instructions."
+                ),
+                "auto_refresh_attempted": True,
+            }
+
         logger.info(
             "Session auto-refreshed successfully",
-            elapsed_seconds=result.get("elapsed_seconds"),
+            elapsed_seconds=(result or {}).get("elapsed_seconds"),
         )
         return None
 
