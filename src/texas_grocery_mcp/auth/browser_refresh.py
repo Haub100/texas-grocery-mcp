@@ -353,23 +353,36 @@ async def refresh_session_with_browser(
                         await browser.close()
                         raise BrowserRefreshError(f"HEB.com returned HTTP status {response.status}")
 
-                    # Fail fast if we're on a security interstitial.
-                    if await _detect_security_challenge(page) or await _detect_captcha(page):
-                        await browser.close()
-                        raise BrowserRefreshError(
-                            "Security challenge detected in headless mode. "
-                            "Run session_refresh(headless=False) to complete it."
-                        )
-
-                    if not await _check_authenticated(context):
-                        await browser.close()
-                        raise LoginRequiredError(
-                            "HEB requires login. Your session has expired.\n"
-                            "Run session_refresh(headless=False) to login manually."
-                        )
-
+                    # Let the page + Incapsula JS settle so reese84 regenerates.
                     logger.info("Waiting for reese84 token generation...")
                     await page.wait_for_timeout(5000)
+
+                    # Success is defined by reese84 actually renewing (renewTime moved
+                    # into the future), NOT by a page-content heuristic. HEB serves the
+                    # real page behind an Incapsula JS shell that the content-based
+                    # challenge detector mis-flags, so it false-aborts refreshes that
+                    # actually succeed (verified: a raw load renews reese84 with HTTP
+                    # 200 while _detect_security_challenge reports a "challenge"). Only
+                    # if reese84 did NOT renew do we investigate a real challenge/login.
+                    reese_renewed = await page.evaluate(
+                        "() => { try { const r = JSON.parse("
+                        "window.localStorage.getItem('reese84') || '{}'); "
+                        "return typeof r.renewTime === 'number' && r.renewTime > Date.now(); } "
+                        "catch (e) { return false; } }"
+                    )
+                    if not reese_renewed:
+                        if await _detect_security_challenge(page) or await _detect_captcha(page):
+                            await browser.close()
+                            raise BrowserRefreshError(
+                                "Security challenge detected in headless mode. "
+                                "Run session_refresh(headless=False) to complete it."
+                            )
+                        if not await _check_authenticated(context):
+                            await browser.close()
+                            raise LoginRequiredError(
+                                "HEB requires login. Your session has expired.\n"
+                                "Run session_refresh(headless=False) to login manually."
+                            )
 
                     logger.info("Saving session state", auth_path=str(auth_path))
                     auth_path.parent.mkdir(parents=True, exist_ok=True)

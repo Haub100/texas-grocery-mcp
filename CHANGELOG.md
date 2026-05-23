@@ -46,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefers `<auth_dir>/browser_ua.txt` (written by `capture_session.py` from the
   real capture browser). All 3 Playwright contexts + the API client now use it,
   so refresh/API always match the captured fingerprint.
+- **Headless refresh no longer false-aborts on a normal page (the real fix):** the
+  content-heuristic `_detect_security_challenge` mis-flags HEB's normal page (served
+  behind an Incapsula JS shell) as a "security challenge" and aborted refreshes that
+  would have succeeded — verified: a raw page load renews reese84 with HTTP 200 in the
+  exact conditions where the refresh reported a challenge. The headless refresh now keys
+  success off **reese84 actually renewing** (its `renewTime` advancing) and only checks
+  for a real challenge/login if it did NOT renew. Note this supersedes the
+  `auto_refresh_headless` workaround above: **headless is the working mode for HEB**; the
+  headed/xvfb path draws a real hCaptcha — keep `AUTO_REFRESH_HEADLESS` unset/`true`.
 
 ## [0.1.2] - 2026-02-02
 
