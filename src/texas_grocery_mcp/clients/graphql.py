@@ -75,6 +75,31 @@ DEFAULT_PERSISTED_QUERIES = {
 }
 
 
+# --- Mobile (bearer) GraphQL — the durable, Incapsula-free path ----------------
+# When OAuth bearer tokens are present (tokens.json on the auth volume), operations
+# go to HEB's MOBILE API edge with a Bearer token instead of www.heb.com + reese84
+# cookies. That host has no Incapsula challenge, so it works regardless of anti-bot
+# heat. Mobile persisted-query hashes are back-compat-stable (HEB can't break old app
+# installs), so we hardcode them (from iHildy/heb-sdk-unofficial). See
+# auth/oauth.py + ~/.claude/plans/heb-oauth-pkce-adoption.md.
+MOBILE_GRAPHQL_ENDPOINT = "https://api-edge.heb-ecom-api.hebdigital-prd.com/graphql"
+MOBILE_USER_AGENT = "MyHEB/5.9.0.60733 (iOS 18.7.2; iPhone16,2) CFNetwork/1.0 Darwin/24.6.0"
+# web operation name -> (mobile operation name, mobile sha256 hash)
+MOBILE_OPS: dict[str, tuple[str, str]] = {
+    "cartEstimated": ("cartV2", "d57a76ebe19efdb3a06323afa65eb176a1c92e478ab9916742fba3cb2cc9f075"),
+    "productSearchPageV2": (
+        "ProductSearchPageV2",
+        "a723225732e31edad1e7ab28f26177b57e7257c7f457b714d77951f56c85e63e",
+    ),
+    "cartItemV2": (
+        "addItemToCartV2",
+        "ba00328429c15935088d93be84cc41b4f0032c388e8ccd11cd3ee5b8e7d77e41",
+    ),
+}
+# Shopping context used for mobile/bearer pricing + availability.
+MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
+
+
 class HashStore:
     """Mutable registry of persisted-query hashes with on-disk override cache.
 
@@ -249,6 +274,7 @@ class HEBGraphQLClient:
         self.circuit_breaker = CircuitBreaker("heb_api")
         self._client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
+        self._bearer_client: httpx.AsyncClient | None = None
         self._build_id: str | None = None
 
         # Initialize throttlers for rate limiting
@@ -326,6 +352,9 @@ class HEBGraphQLClient:
         if self._auth_client:
             await self._auth_client.aclose()
             self._auth_client = None
+        if self._bearer_client:
+            await self._bearer_client.aclose()
+            self._bearer_client = None
 
     async def _get_build_id(self) -> str:
         """Extract Next.js build ID from HEB homepage.
@@ -1143,6 +1172,10 @@ class HEBGraphQLClient:
         attempts: list[ProductSearchAttempt] = []
         security_challenge_detected = False
         search_url = f"https://www.heb.com/search?q={query.replace(' ', '+')}"
+
+        # Durable OAuth bearer path (mobile API, no Incapsula) when tokens are present.
+        if self._bearer_available():
+            return await self._search_products_bearer(query, store_id, limit)
 
         # Try authenticated search first
         auth_client = await self._get_authenticated_client()
@@ -2017,6 +2050,19 @@ class HEBGraphQLClient:
         Returns:
             Cart response data or error dict if not authenticated
         """
+        if self._bearer_available():
+            return await self._execute_bearer_query(
+                "cartItemV2",
+                {
+                    "includeTax": False,
+                    "isAuthenticated": True,
+                    "parentOrderId": None,
+                    "productId": product_id,
+                    "quantity": quantity,
+                    "skuId": sku_id,
+                },
+            )
+
         auth_client = await self._get_authenticated_client()
         if not auth_client:
             return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
@@ -2032,14 +2078,177 @@ class HEBGraphQLClient:
             },
         )
 
-    async def get_cart(self) -> dict[str, Any]:
-        """Get current cart contents using authenticated GraphQL.
+    def _bearer_available(self) -> bool:
+        """True if OAuth bearer tokens exist (the durable, Incapsula-free path)."""
+        from texas_grocery_mcp.auth.oauth import load_tokens
 
-        Requires authentication cookies to be available.
+        return load_tokens(get_settings().auth_state_path.parent) is not None
+
+    async def _get_bearer_client(self) -> httpx.AsyncClient:
+        if self._bearer_client is None:
+            self._bearer_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0), follow_redirects=True
+            )
+        return self._bearer_client
+
+    async def _execute_bearer_query(
+        self, web_operation: str, variables: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run a persisted query against the MOBILE bearer endpoint (no Incapsula).
+
+        Maps the web operation name to its mobile equivalent + hash, attaches a fresh
+        Bearer token (refreshed as needed), and returns the raw GraphQL ``data`` dict
+        — same contract as the cookie/web path, so tools are unchanged.
+        """
+        from texas_grocery_mcp.auth.oauth import ensure_access_token
+
+        mobile = MOBILE_OPS.get(web_operation)
+        if mobile is None:
+            raise ValueError(f"No mobile mapping for operation: {web_operation}")
+        mobile_op, mobile_hash = mobile
+        token = ensure_access_token(get_settings().auth_state_path.parent)
+        if not token:
+            return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
+
+        payload = {
+            "operationName": mobile_op,
+            "variables": variables,
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": mobile_hash}},
+        }
+        client = await self._get_bearer_client()
+        self.circuit_breaker.check()
+        try:
+            resp = await client.post(
+                MOBILE_GRAPHQL_ENDPOINT,
+                json=payload,
+                headers={
+                    "authorization": f"Bearer {token}",
+                    "content-type": "application/json",
+                    "user-agent": MOBILE_USER_AGENT,
+                },
+            )
+            resp.raise_for_status()
+            data: Any = resp.json()
+            if isinstance(data, dict) and data.get("errors"):
+                raise GraphQLError(data["errors"])
+            self.circuit_breaker.record_success()
+            payload_data = data.get("data") if isinstance(data, dict) else None
+            return cast(dict[str, Any], payload_data) if isinstance(payload_data, dict) else {}
+        except (httpx.HTTPError, GraphQLError) as e:
+            self.circuit_breaker.record_failure()
+            logger.error("bearer query failed", operation=mobile_op, error=str(e))
+            raise
+
+    def _map_mobile_product(self, item: dict[str, Any]) -> Product:
+        """Map a mobile (bearer) product to our Product model (mirrors the SDK's
+        mapMobileProduct: pick the curbside/delivery SKU, resolve sale→list price)."""
+        skus = item.get("skus") or []
+        sku = next(
+            (
+                s
+                for s in skus
+                if any(
+                    a in (s.get("productAvailability") or [])
+                    for a in ("CURBSIDE_PICKUP", "DELIVERY")
+                )
+            ),
+            skus[0] if skus else {},
+        )
+        ctx_prices = sku.get("contextPrices") or []
+        price_ctx = (
+            next(
+                (p for p in ctx_prices if p.get("context") in ("CURBSIDE_PICKUP", "CURBSIDE")),
+                None,
+            )
+            or next((p for p in ctx_prices if p.get("context") == "ONLINE"), None)
+            or (ctx_prices[0] if ctx_prices else {})
+        )
+        price_obj = price_ctx.get("salePrice") or price_ctx.get("listPrice") or {}
+        unit_obj = price_ctx.get("unitSalePrice") or price_ctx.get("unitListPrice") or {}
+        brand_obj = item.get("brand")
+        brand_name = brand_obj.get("name") if isinstance(brand_obj, dict) else None
+        images = item.get("carouselImageUrls") or []
+        return Product(
+            sku=str(sku.get("id") or item.get("productId") or ""),
+            product_id=str(item["productId"]) if item.get("productId") else None,
+            name=item.get("displayName") or "",
+            price=float(price_obj.get("amount") or 0.0),
+            available=bool(item.get("isAvailableForCheckout", True)),
+            brand=brand_name,
+            size=sku.get("customerFriendlySize"),
+            price_per_unit=unit_obj.get("formattedAmount") or None,
+            image_url=images[0] if images else None,
+            has_coupon=bool(item.get("showCouponFlag", False)),
+        )
+
+    async def _search_products_bearer(
+        self, query: str, store_id: str, limit: int
+    ) -> ProductSearchResult:
+        """Product search via the mobile bearer API (no Incapsula)."""
+        try:
+            sid = int(str(store_id).strip())
+        except (TypeError, ValueError):
+            sid = 0
+        sc = MOBILE_SHOPPING_CONTEXT
+        variables = {
+            "isAuthenticated": True,
+            "params": {
+                "doNotSuggestPhrase": False,
+                "pageSize": max(50, limit),
+                "query": query,
+                "shoppingContext": sc,
+                "storeId": sid,
+            },
+            "searchMode": "MAIN_SEARCH",
+            "searchPageLayout": "MOBILE_SEARCH_PAGE_LAYOUT",
+            "shoppingContext": sc,
+            "storeId": sid,
+            "storeIdID": str(sid),
+            "storeIdString": str(sid),
+        }
+        data = await self._execute_bearer_query("productSearchPageV2", variables)
+        if data.get("error"):
+            return ProductSearchResult(
+                products=[], count=0, query=query, store_id=store_id, data_source="bearer"
+            )
+        page = data.get("productSearchPageV2") or {}
+        components = (page.get("layout") or {}).get("visualComponents") or []
+        grid: dict[str, Any] = next(
+            (c for c in components if c.get("__typename") == "SearchGridV2"),
+            next((c for c in components if isinstance(c.get("items"), list)), {}),
+        )
+        products: list[Product] = []
+        for it in grid.get("items") or []:
+            try:
+                p = self._map_mobile_product(it)
+            except Exception:  # noqa: BLE001 - skip malformed items
+                continue
+            if p.name and (p.product_id or p.sku):
+                products.append(p)
+            if len(products) >= limit:
+                break
+        return ProductSearchResult(
+            products=products,
+            count=len(products),
+            query=query,
+            store_id=store_id,
+            data_source="bearer",
+        )
+
+    async def get_cart(self) -> dict[str, Any]:
+        """Get current cart contents.
+
+        Prefers the durable OAuth bearer/mobile path (no Incapsula) when tokens are
+        present; falls back to the cookie/web path otherwise.
 
         Returns:
-            Cart data or error dict if not authenticated
+            Cart data (raw GraphQL ``data``, with a ``cartV2`` key) or error dict.
         """
+        if self._bearer_available():
+            return await self._execute_bearer_query(
+                "cartEstimated", {"includeTax": False, "isAuthenticated": True}
+            )
+
         auth_client = await self._get_authenticated_client()
         if not auth_client:
             return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
