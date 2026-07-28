@@ -11,11 +11,25 @@ services:
       - REDIS_URL=redis://redis:6379
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HEB_DEFAULT_STORE=${HEB_DEFAULT_STORE:-}
+      # HTTP+OAuth mode (for remote MCP clients like claude.ai custom connectors).
+      # Disabled by default — stdio is used unless MCP_HTTP_MODE=true. When enabled,
+      # bind a TLS-terminating proxy (e.g. `tailscale serve`/`funnel`) to the mapped
+      # port below; this container only speaks plain HTTP.
+      - MCP_HTTP_MODE=${MCP_HTTP_MODE:-false}
+      - MCP_HTTP_HOST=0.0.0.0
+      - MCP_HTTP_PORT=${MCP_HTTP_PORT:-8002}
+      - MCP_SERVER_URL=${MCP_SERVER_URL:-}
+      - MCP_OAUTH_CLIENT_SECRET=${MCP_OAUTH_CLIENT_SECRET:-}
+      - MCP_OAUTH_CLIENT_ID=${MCP_OAUTH_CLIENT_ID:-texas-grocery-mcp}
+    ports:
+      # Bound to loopback only — reach it via Tailscale serve/funnel, not the LAN.
+      - "127.0.0.1:${MCP_HTTP_PORT:-8002}:${MCP_HTTP_PORT:-8002}"
     depends_on:
       redis:
         condition: service_healthy
     stdin_open: true
     tty: true
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
