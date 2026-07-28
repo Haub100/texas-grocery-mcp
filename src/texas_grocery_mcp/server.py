@@ -40,6 +40,11 @@ from texas_grocery_mcp.tools.store import (
     store_get_default,
     store_search,
 )
+from texas_grocery_mcp.transports import (
+    build_auth_provider,
+    is_http_mode_enabled,
+    register_openid_configuration_route,
+)
 from texas_grocery_mcp.utils.config import get_settings
 
 # Configure logging before anything else
@@ -246,12 +251,24 @@ When login requires human action (login form, CAPTCHA, 2FA, or a bot/WAF interst
 7. Repeat until `status: "success"` or `status: "failed"`
 """
 
+# HTTP+OAuth transport (for remote MCP clients like claude.ai custom connectors) is
+# opt-in via MCP_HTTP_MODE=true. Disabled by default: stdio for local MCP clients.
+_http_mode = is_http_mode_enabled()
+_http_config = None
+_auth_provider = None
+if _http_mode:
+    _auth_provider, _http_config = build_auth_provider()
+
 mcp = FastMCP(
     name="texas-grocery-mcp",
     version="0.2.0",
     instructions=MCP_INSTRUCTIONS,
     lifespan=lifespan,
+    auth=_auth_provider,
 )
+
+if _http_mode and _http_config is not None:
+    register_openid_configuration_route(mcp, _http_config.server_url)
 
 # Register store tools
 mcp.tool(annotations={"readOnlyHint": True})(store_search)
@@ -300,8 +317,23 @@ mcp.tool(annotations={"readOnlyHint": True})(health_ready)
 
 
 def main() -> None:
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server.
+
+    stdio by default (local MCP clients). Set MCP_HTTP_MODE=true to serve
+    streamable-HTTP + OAuth instead, for remote clients such as claude.ai
+    custom connectors — pair with a TLS-terminating proxy (e.g. `tailscale
+    serve`/`funnel`) in front, since this binds plain HTTP.
+    """
+    if _http_mode and _http_config is not None:
+        logger.info(
+            "Starting in HTTP+OAuth mode",
+            host=_http_config.host,
+            port=_http_config.port,
+            server_url=_http_config.server_url,
+        )
+        mcp.run(transport="http", host=_http_config.host, port=_http_config.port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

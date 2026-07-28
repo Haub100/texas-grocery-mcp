@@ -27,6 +27,12 @@ COPY --from=builder /app/dist/*.whl ./
 # Install the package
 RUN pip install --no-cache-dir *.whl && rm *.whl
 
+# One-time HEB OAuth login helper (docker compose exec texas-grocery-mcp
+# python scripts/heb_oauth_login.py start) — no Playwright/Chromium needed.
+COPY scripts/heb_oauth_login.py ./scripts/heb_oauth_login.py
+
+RUN chown -R appuser:appuser /app
+
 # Switch to non-root user
 USER appuser
 
