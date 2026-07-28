@@ -5,25 +5,30 @@ services:
   texas-grocery-mcp:
     build: .
     volumes:
-      # Mount auth state from host
-      - ~/.texas-grocery-mcp:/home/appuser/.texas-grocery-mcp
+      # Mount auth state from host (container now runs as root — see Dockerfile)
+      - ~/.texas-grocery-mcp:/root/.texas-grocery-mcp
+      # Persists this container's own Tailscale node identity/state across
+      # restarts (otherwise a restart would re-register as a brand new node).
+      - tailscale-state:/var/lib/tailscale
     environment:
       - REDIS_URL=redis://redis:6379
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - HEB_DEFAULT_STORE=${HEB_DEFAULT_STORE:-}
       # HTTP+OAuth mode (for remote MCP clients like claude.ai custom connectors).
-      # Disabled by default — stdio is used unless MCP_HTTP_MODE=true. When enabled,
-      # bind a TLS-terminating proxy (e.g. `tailscale serve`/`funnel`) to the mapped
-      # port below; this container only speaks plain HTTP.
+      # Disabled by default — stdio is used unless MCP_HTTP_MODE=true.
       - MCP_HTTP_MODE=${MCP_HTTP_MODE:-false}
       - MCP_HTTP_HOST=0.0.0.0
       - MCP_HTTP_PORT=${MCP_HTTP_PORT:-8002}
       - MCP_SERVER_URL=${MCP_SERVER_URL:-}
       - MCP_OAUTH_CLIENT_SECRET=${MCP_OAUTH_CLIENT_SECRET:-}
       - MCP_OAUTH_CLIENT_ID=${MCP_OAUTH_CLIENT_ID:-texas-grocery-mcp}
-    ports:
-      # Bound to loopback only — reach it via Tailscale serve/funnel, not the LAN.
-      - "127.0.0.1:${MCP_HTTP_PORT:-8002}:${MCP_HTTP_PORT:-8002}"
+      # Tailscale (runs *inside* this container, userspace networking — no host
+      # sudo, no --privileged). Leave TS_AUTHKEY unset to skip Tailscale
+      # entirely; set it to give this container its own tailnet identity and
+      # (with MCP_HTTP_MODE=true) a Funnel-exposed public URL distinct from
+      # the host. Generate a reusable key: https://login.tailscale.com/admin/settings/keys
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_HOSTNAME=${TS_HOSTNAME:-texas-grocery-mcp}
     depends_on:
       redis:
         condition: service_healthy
@@ -44,3 +49,4 @@ services:
 
 volumes:
   redis-data:
+  tailscale-state:
