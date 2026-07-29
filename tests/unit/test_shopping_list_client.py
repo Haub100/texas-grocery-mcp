@@ -192,3 +192,114 @@ async def test_delete_shopping_list_no_auth(client):
 
     assert result["error"] is True
     assert result["code"] == "NOT_AUTHENTICATED"
+
+
+# ---------------------------------------------------------------------------
+# Bearer/mobile routing
+#
+# Shopping-list ops prefer the mobile bearer path (no Incapsula/reese84). The
+# mobile variable shapes differ from web — sort is STORE_LOCATION and adds
+# carry an explicit quantity — so these assert the request side, not just that
+# a call happened. Hashes/op names captured from live MyHEB traffic 2026-07-29.
+# ---------------------------------------------------------------------------
+
+
+def _bearer(client, monkeypatch, data: dict) -> AsyncMock:
+    """Force the bearer path and capture what it was called with."""
+    spy = AsyncMock(return_value=data)
+    monkeypatch.setattr(client, "_bearer_available", lambda: True)
+    monkeypatch.setattr(client, "_execute_bearer_query", spy)
+    return spy
+
+
+def test_mobile_ops_cover_all_shopping_list_operations():
+    from texas_grocery_mcp.clients.graphql import MOBILE_OPS
+
+    for web_op in (
+        "getShoppingListsV2",
+        "getShoppingListV2",
+        "createShoppingList",
+        "addToShoppingListV2",
+        "deleteShoppingListItems",
+        "deleteShoppingLists",
+    ):
+        mobile_op, mobile_hash = MOBILE_OPS[web_op]
+        assert mobile_op and len(mobile_hash) == 64
+
+
+@pytest.mark.asyncio
+async def test_get_shopping_lists_prefers_bearer(client, monkeypatch):
+    data = {
+        "getShoppingListsV2": {
+            "thisPage": {"totalCount": 1},
+            "lists": [
+                {
+                    "id": "list-1",
+                    "name": "Weekly Items",
+                    "totalItemCount": 3,
+                    "updated": "2026-07-29T00:00:00Z",
+                    "fulfillment": {"store": {"storeNumber": 373, "name": "620 H-E-B"}},
+                }
+            ],
+        }
+    }
+    spy = _bearer(client, monkeypatch, data)
+    # The web client must never be consulted when bearer tokens exist.
+    with patch.object(client, "_get_authenticated_client") as web:
+        result = await client.get_shopping_lists()
+
+    web.assert_not_called()
+    spy.assert_awaited_once_with("getShoppingListsV2", {"page": {}})
+    assert result.lists[0].id == "list-1"
+
+
+@pytest.mark.asyncio
+async def test_get_shopping_list_bearer_sorts_by_store_location(client, monkeypatch):
+    data = {
+        "getShoppingListV2": {
+            "id": "list-1",
+            "name": "Weekly Items",
+            "totalItemCount": 0,
+            "itemPage": {"items": []},
+        }
+    }
+    spy = _bearer(client, monkeypatch, data)
+    await client.get_shopping_list("list-1")
+
+    variables = spy.await_args.args[1]
+    assert variables["input"]["page"]["sort"] == "STORE_LOCATION"
+
+
+@pytest.mark.asyncio
+async def test_add_to_shopping_list_bearer_sends_quantity(client, monkeypatch):
+    data = {
+        "addShoppingListItemsV2": {
+            "id": "list-1",
+            "name": "Weekly Items",
+            "totalItemCount": 1,
+            "total": {"formattedPrice": "$4.29"},
+        }
+    }
+    spy = _bearer(client, monkeypatch, data)
+    result = await client.add_to_shopping_list("list-1", ["314125"])
+
+    variables = spy.await_args.args[1]
+    assert variables["input"]["listItems"] == [
+        {"item": {"productId": "314125"}, "quantityOrWeight": {"quantity": 1}}
+    ]
+    assert variables["input"]["page"]["sort"] == "STORE_LOCATION"
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_shopping_list_bearer_token_failure_is_auth_error(client, monkeypatch):
+    """A missing/unrefreshable token must not be parsed as list data."""
+    _bearer(
+        client,
+        monkeypatch,
+        {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"},
+    )
+    result = await client.create_shopping_list("Weekly Items", "373")
+
+    assert result["error"] is True
+    assert result["code"] == "NOT_AUTHENTICATED"
