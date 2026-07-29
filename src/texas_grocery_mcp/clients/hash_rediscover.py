@@ -70,6 +70,10 @@ OPERATION_PAGES: dict[str, tuple[str, ...]] = {
     "getFrequentlyPurchasedProducts": ("https://www.heb.com/cart",),
     "historicCashbackEstimate": ("https://www.heb.com/cart",),
     "shoppingListCarouselV2": ("https://www.heb.com/",),
+    # /shopping-list fires both on load: it redirects to the user's
+    # most-recently-updated list, loading the list index alongside it.
+    "getShoppingListsV2": ("https://www.heb.com/shopping-list",),
+    "getShoppingListV2": ("https://www.heb.com/shopping-list",),
 }
 
 # Used when no target_operation is given (or its op isn't in
@@ -245,10 +249,63 @@ async def _flow_select_pickup_fulfillment(page: Any) -> None:
     await button.click()
 
 
+async def _flow_shopping_list_cleanup(page: Any) -> None:
+    """Trigger createShoppingList / addToShoppingListV2 / deleteShoppingListItems /
+    deleteShoppingLists via a self-cleaning round trip: create a throwaway list,
+    add one item, remove it, then delete the list. Net server-side effect is a
+    no-op (nothing left behind), satisfying the state-preserving requirement —
+    only possible because deleteShoppingLists exists; before it did, there was
+    no way to clean up after createShoppingList's discovery flow.
+
+    Registered under all four operation names: whichever one triggered
+    rediscovery, this same flow runs and captures all four hashes in one pass
+    (discover_mutation_hash only keeps the one it was asked for).
+
+    Selectors verified 2026-07-28 against a real logged-in session.
+    """
+    await page.goto("https://www.heb.com/shopping-list", wait_until="domcontentloaded")
+
+    await page.get_by_text("Create new list", exact=False).first.click()
+    name_field = page.get_by_label("List name", exact=False)
+    await name_field.wait_for(state="visible", timeout=15_000)
+    await name_field.fill("MCP Hash Discovery TEMP")
+    await page.get_by_role("button", name="Create list", exact=False).click()
+    await page.wait_for_timeout(2_000)
+
+    await page.get_by_role("button", name="Add an item", exact=False).click()
+    search = page.get_by_placeholder("Add or search for items", exact=False)
+    await search.wait_for(state="visible", timeout=15_000)
+    await search.fill("milk")
+    await page.wait_for_timeout(2_000)
+    add_button = page.locator('button[aria-label^="Add "][aria-label$=" to list"]').first
+    await add_button.wait_for(state="visible", timeout=15_000)
+    await add_button.click(force=True)
+    await page.wait_for_timeout(1_500)
+    await page.keyboard.press("Escape")
+
+    remove_button = page.locator('button[aria-label="Remove product"]').first
+    await remove_button.wait_for(state="visible", timeout=15_000)
+    await remove_button.click(force=True)
+    confirm_remove = page.get_by_role("button", name="Remove", exact=True)
+    await confirm_remove.wait_for(state="visible", timeout=15_000)
+    await confirm_remove.click(force=True)
+    await page.wait_for_timeout(1_500)
+
+    await page.get_by_role("button", name="List options", exact=True).click(force=True)
+    await page.get_by_text("Delete list", exact=True).first.click(force=True)
+    confirm_delete = page.get_by_role("button", name="Delete", exact=True)
+    await confirm_delete.wait_for(state="visible", timeout=15_000)
+    await confirm_delete.click(force=True)
+
+
 # Operation name -> click-flow that triggers it. New mutations: add a
 # flow function above and an entry here. NOTHING in OPERATION_PAGES.
 MUTATION_FLOWS: dict[str, MutationFlow] = {
     "SelectPickupFulfillment": _flow_select_pickup_fulfillment,
+    "createShoppingList": _flow_shopping_list_cleanup,
+    "addToShoppingListV2": _flow_shopping_list_cleanup,
+    "deleteShoppingListItems": _flow_shopping_list_cleanup,
+    "deleteShoppingLists": _flow_shopping_list_cleanup,
 }
 
 

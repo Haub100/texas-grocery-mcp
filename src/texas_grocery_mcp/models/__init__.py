@@ -18,6 +18,12 @@ from texas_grocery_mcp.models.product import (
     ProductSearchAttempt,
     ProductSearchResult,
 )
+from texas_grocery_mcp.models.shopping_list import (
+    ShoppingListDetail,
+    ShoppingListItem,
+    ShoppingListsResult,
+    ShoppingListSummary,
+)
 from texas_grocery_mcp.models.store import (
     GeocodedLocation,
     SearchAttempt,
@@ -48,6 +54,10 @@ __all__ = [
     "ProductSearchAttempt",
     "ProductSearchResult",
     "SearchAttempt",
+    "ShoppingListDetail",
+    "ShoppingListItem",
+    "ShoppingListSummary",
+    "ShoppingListsResult",
     "Store",
     "StoreHours",
     "StoreSearchResult",
