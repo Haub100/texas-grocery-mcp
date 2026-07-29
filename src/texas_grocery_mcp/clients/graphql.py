@@ -128,13 +128,42 @@ MOBILE_OPS: dict[str, tuple[str, str]] = {
         "orderDetails",
         "bd1ba9beb2e4af8a4099965d1b4ce455d28532e8b727d490f3a7df6486d5508f",
     ),
-    # Note: shopping-list ops (getShoppingListsV2, createShoppingList,
-    # addToShoppingListV2) were evaluated for this mobile path too, but the
-    # hashes from iHildy/heb-sdk-unofficial all returned PersistedQueryNotFound
-    # on live testing (2026-07-28) and mobile hashes have no self-heal to
-    # recover from that — see DEFAULT_PERSISTED_QUERIES for the web/self-heal
-    # path those operations use instead.
+    # Shopping lists. Captured from live MyHEB iOS 6.8.0 traffic (2026-07-29) via
+    # an on-device proxy. The earlier iHildy/heb-sdk-unofficial hashes failed here
+    # because the MOBILE operation names differ from the web ones — mobile uses the
+    # web *response key* as the operation name (web `addToShoppingListV2` is mobile
+    # `AddShoppingListItemsV2`). Response keys are identical on both paths, so the
+    # existing result parsing is shared.
+    "getShoppingListsV2": (
+        "GetShoppingListsV2",
+        "a9ae2759b62c1c4ef35b2eec9de1f9cff839ac238382d206f530f2550de9407a",
+    ),
+    "getShoppingListV2": (
+        "ShoppingListV2",
+        "eed679190bb0dbc1016b3e18a6a55a1abfc517c02da0e29fe821259ca41bf00e",
+    ),
+    "createShoppingList": (
+        "CreateShoppingListV2",
+        "f62c24e7e33299fcbc6d7fa9663dc43ff524b35c95ea57a8bc9c1e79021b8155",
+    ),
+    "addToShoppingListV2": (
+        "AddShoppingListItemsV2",
+        "849e40e3b79155651adf7494ab5e4ccad7b0b9dc4ae38e70d55f9c2dbe658c59",
+    ),
+    "deleteShoppingListItems": (
+        "DeleteShoppingListItemsV2",
+        "a1042a7d885d10734ae8dd4b511f2c6ce5b8340b74dcf51c245e3b457f37a465",
+    ),
+    "deleteShoppingLists": (
+        "DeleteShoppingListsV2",
+        "d1f14e110485e35acb98725e7704d6089d65f4546417294941be19a6949d13e1",
+    ),
 }
+# API gateway key sent by the MyHEB app on every mobile GraphQL call. Existing ops
+# work without it, but sending it matches the real client. Captured 2026-07-29.
+MOBILE_API_KEY = "l7xx3545d7490b224976a1ce681a69423ea6"
+# Mobile list ops sort by physical store layout rather than the web's CATEGORY.
+MOBILE_LIST_SORT = "STORE_LOCATION"
 # Shopping context used for mobile/bearer pricing + availability.
 MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
 
@@ -2171,12 +2200,30 @@ class HEBGraphQLClient:
                     "authorization": f"Bearer {token}",
                     "content-type": "application/json",
                     "user-agent": MOBILE_USER_AGENT,
+                    "apikey": MOBILE_API_KEY,
+                    "x-apollo-operation-name": mobile_op,
                 },
             )
             resp.raise_for_status()
             data: Any = resp.json()
             if isinstance(data, dict) and data.get("errors"):
-                raise GraphQLError(data["errors"])
+                errors = data["errors"]
+                # Mobile hashes are hardcoded with no self-heal (unlike the web
+                # path's HashStore/rediscovery), so a rotated hash would otherwise
+                # surface as an opaque GraphQLError. Name it explicitly — recovery
+                # means re-capturing from live MyHEB traffic. See MOBILE_OPS.
+                if any(
+                    isinstance(e, dict) and "PersistedQueryNotFound" in str(e.get("message", ""))
+                    for e in errors
+                ):
+                    logger.error(
+                        "mobile persisted-query hash rejected — hash likely rotated; "
+                        "re-capture from live MyHEB app traffic",
+                        operation=mobile_op,
+                        web_operation=web_operation,
+                        sha256_hash=mobile_hash,
+                    )
+                raise GraphQLError(errors)
             self.circuit_breaker.record_success()
             payload_data = data.get("data") if isinstance(data, dict) else None
             return cast(dict[str, Any], payload_data) if isinstance(payload_data, dict) else {}
@@ -3022,30 +3069,57 @@ class HEBGraphQLClient:
     # Shopping List Methods
     # ========================================================================
     #
-    # All six operations go through the web/cookie persisted-query path with
-    # full self-heal (HashStore + MUTATION_FLOWS/OPERATION_PAGES in
-    # hash_rediscover.py), same as CouponClip/SelectPickupFulfillment. HEB's
-    # mobile API was evaluated for list/create/add-item (durable hashes would
-    # mean no self-heal needed, like cartItemV2 etc.) but the mobile hashes
-    # from iHildy/heb-sdk-unofficial all returned PersistedQueryNotFound on
-    # live testing (2026-07-28) — apparently captured from a stale MyHEB app
-    # build — and mobile hashes have no self-heal mechanism to recover from
-    # that. The web path is what's actually verified working.
+    # All six operations prefer the mobile/bearer path (no Incapsula, no reese84
+    # keep-warm, no Chromium) and fall back to the web/cookie persisted-query path
+    # with self-heal (HashStore + MUTATION_FLOWS/OPERATION_PAGES in
+    # hash_rediscover.py) when tokens.json is absent. Both paths return identical
+    # response keys, so only the request side differs — see
+    # _execute_shopping_list_query and MOBILE_OPS.
+
+    async def _execute_shopping_list_query(
+        self,
+        web_operation: str,
+        web_variables: dict[str, Any],
+        mobile_variables: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Run a shopping-list op, preferring the bearer/mobile path.
+
+        The two paths need different variable shapes (mobile sorts by
+        STORE_LOCATION, wraps paging differently, and wants explicit
+        quantities), but return the same response keys.
+
+        Returns:
+            The GraphQL ``data`` dict, or None if neither path is authenticated.
+        """
+        if self._bearer_available():
+            data = await self._execute_bearer_query(web_operation, mobile_variables)
+            # _execute_bearer_query signals a missing/unrefreshable token with an
+            # error dict; treat that as unauthenticated so callers emit their own
+            # NOT_AUTHENTICATED result rather than parsing it as list data.
+            return None if data.get("error") else data
+
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return None
+        return await self._execute_persisted_query_with_client(
+            auth_client, web_operation, web_variables
+        )
 
     async def get_shopping_lists(self) -> ShoppingListsResult:
-        """List all of the user's HEB shopping lists (web/cookie, self-heals).
+        """List all of the user's HEB shopping lists (bearer, falls back to web).
 
         Returns:
             ShoppingListsResult with list summaries, or empty on auth failure.
         """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            logger.warning("Shopping lists require an authenticated web session")
+        data = await self._execute_shopping_list_query(
+            "getShoppingListsV2",
+            {},
+            {"page": {}},
+        )
+        if data is None:
+            logger.warning("Shopping lists require an authenticated session")
             return ShoppingListsResult(lists=[], total=0)
 
-        data = await self._execute_persisted_query_with_client(
-            auth_client, "getShoppingListsV2", {}
-        )
         lists_data = data.get("getShoppingListsV2", {})
         summaries = []
         for lst in lists_data.get("lists", []):
@@ -3071,7 +3145,7 @@ class HEBGraphQLClient:
         page: int = 0,
         size: int = 500,
     ) -> ShoppingListDetail | None:
-        """Get the full contents of a single shopping list (web/cookie, self-heals).
+        """Get the full contents of a single shopping list (bearer, falls back to web).
 
         Args:
             list_id: The shopping list UUID
@@ -3081,13 +3155,7 @@ class HEBGraphQLClient:
         Returns:
             ShoppingListDetail, or None if not found/not authenticated.
         """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            logger.warning("Shopping list detail requires an authenticated web session")
-            return None
-
-        data = await self._execute_persisted_query_with_client(
-            auth_client,
+        data = await self._execute_shopping_list_query(
             "getShoppingListV2",
             {
                 "input": {
@@ -3100,7 +3168,22 @@ class HEBGraphQLClient:
                     },
                 }
             },
+            {
+                "input": {
+                    "id": list_id,
+                    "page": {
+                        "page": page,
+                        "size": size,
+                        "sort": MOBILE_LIST_SORT,
+                        "sortDirection": "ASC",
+                    },
+                }
+            },
         )
+        if data is None:
+            logger.warning("Shopping list detail requires an authenticated session")
+            return None
+
         sl = data.get("getShoppingListV2")
         if not sl:
             return None
@@ -3140,7 +3223,7 @@ class HEBGraphQLClient:
         )
 
     async def create_shopping_list(self, name: str, store_id: str) -> dict[str, Any]:
-        """Create a new HEB shopping list (web/cookie, self-heals).
+        """Create a new HEB shopping list (bearer, falls back to web).
 
         Args:
             name: Name for the new list
@@ -3149,19 +3232,17 @@ class HEBGraphQLClient:
         Returns:
             Result dict with the new list's id/name, or an error dict.
         """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
+        variables = {"input": {"name": name, "storeId": str(store_id)}}
+        data = await self._execute_shopping_list_query(
+            "createShoppingList", variables, variables
+        )
+        if data is None:
             return {
                 "error": True,
                 "code": "NOT_AUTHENTICATED",
                 "message": "Login required to create shopping lists",
             }
 
-        data = await self._execute_persisted_query_with_client(
-            auth_client,
-            "createShoppingList",
-            {"input": {"name": name, "storeId": str(store_id)}},
-        )
         result = data.get("createShoppingListV2", {})
         if not result:
             return {
@@ -3174,7 +3255,7 @@ class HEBGraphQLClient:
     async def add_to_shopping_list(
         self, list_id: str, product_ids: list[str]
     ) -> dict[str, Any]:
-        """Add products to an HEB shopping list (web/cookie, self-heals).
+        """Add products to an HEB shopping list (bearer, falls back to web).
 
         Args:
             list_id: The shopping list UUID
@@ -3183,26 +3264,34 @@ class HEBGraphQLClient:
         Returns:
             Result dict with the list's updated item count/total, or an error dict.
         """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
+        data = await self._execute_shopping_list_query(
+            "addToShoppingListV2",
+            {
+                "input": {
+                    "listId": list_id,
+                    "listItems": [{"item": {"productId": pid}} for pid in product_ids],
+                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+            {
+                "input": {
+                    "listId": list_id,
+                    # The mobile app always sends an explicit quantity per item.
+                    "listItems": [
+                        {"item": {"productId": pid}, "quantityOrWeight": {"quantity": 1}}
+                        for pid in product_ids
+                    ],
+                    "page": {"sort": MOBILE_LIST_SORT, "sortDirection": "ASC"},
+                }
+            },
+        )
+        if data is None:
             return {
                 "error": True,
                 "code": "NOT_AUTHENTICATED",
                 "message": "Login required to modify shopping lists",
             }
 
-        list_items = [{"item": {"productId": pid}} for pid in product_ids]
-        data = await self._execute_persisted_query_with_client(
-            auth_client,
-            "addToShoppingListV2",
-            {
-                "input": {
-                    "listId": list_id,
-                    "listItems": list_items,
-                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
-                }
-            },
-        )
         result = data.get("addShoppingListItemsV2", {})
         if not result:
             return {
@@ -3221,7 +3310,7 @@ class HEBGraphQLClient:
     async def remove_from_shopping_list(
         self, list_id: str, item_ids: list[str]
     ) -> dict[str, Any]:
-        """Remove items from an HEB shopping list (web/cookie, self-heals).
+        """Remove items from an HEB shopping list (bearer, falls back to web).
 
         Args:
             list_id: The shopping list UUID
@@ -3230,16 +3319,7 @@ class HEBGraphQLClient:
         Returns:
             Result dict with the list's updated item count/total, or an error dict.
         """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
-            return {
-                "error": True,
-                "code": "NOT_AUTHENTICATED",
-                "message": "Login required to modify shopping lists",
-            }
-
-        data = await self._execute_persisted_query_with_client(
-            auth_client,
+        data = await self._execute_shopping_list_query(
             "deleteShoppingListItems",
             {
                 "input": {
@@ -3248,7 +3328,21 @@ class HEBGraphQLClient:
                     "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
                 }
             },
+            {
+                "input": {
+                    "itemIds": item_ids,
+                    "listId": list_id,
+                    "page": {"sort": MOBILE_LIST_SORT, "sortDirection": "ASC"},
+                }
+            },
         )
+        if data is None:
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Login required to modify shopping lists",
+            }
+
         result = data.get("deleteShoppingListItemsV2", {})
         if not result:
             return {
@@ -3265,7 +3359,7 @@ class HEBGraphQLClient:
         }
 
     async def delete_shopping_list(self, list_id: str) -> dict[str, Any]:
-        """Delete an entire HEB shopping list (web/cookie, self-heals).
+        """Delete an entire HEB shopping list (bearer, falls back to web).
 
         Args:
             list_id: The shopping list UUID to delete
@@ -3273,19 +3367,17 @@ class HEBGraphQLClient:
         Returns:
             Result dict with success status, or an error dict.
         """
-        auth_client = await self._get_authenticated_client()
-        if not auth_client:
+        variables = {"input": {"ids": [list_id]}}
+        data = await self._execute_shopping_list_query(
+            "deleteShoppingLists", variables, variables
+        )
+        if data is None:
             return {
                 "error": True,
                 "code": "NOT_AUTHENTICATED",
                 "message": "Login required to delete shopping lists",
             }
 
-        await self._execute_persisted_query_with_client(
-            auth_client,
-            "deleteShoppingLists",
-            {"input": {"ids": [list_id]}},
-        )
         return {"success": True, "list_id": list_id}
 
     async def select_store(self, store_id: str, ignore_conflicts: bool = False) -> dict[str, Any]:

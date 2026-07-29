@@ -1,7 +1,7 @@
 # 🛒 Texas Grocery MCP
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/nick-pape/texas-grocery-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/nick-pape/texas-grocery-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/Haub100/texas-grocery-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Haub100/texas-grocery-mcp/actions/workflows/ci.yml)
 
 > 🤖 Let AI do your grocery shopping! An MCP server that connects Claude to H-E-B grocery stores.
 
@@ -31,7 +31,7 @@
 ### Quick Start
 
 ```bash
-pip install git+https://github.com/nick-pape/texas-grocery-mcp.git
+pip install git+https://github.com/Haub100/texas-grocery-mcp.git
 ```
 
 > This fork installs from git (it is not on PyPI). The `texas-grocery-mcp` package on PyPI is the original, unmaintained project.
@@ -39,7 +39,7 @@ pip install git+https://github.com/nick-pape/texas-grocery-mcp.git
 ### Full Installation (Recommended) 🚀
 
 ```bash
-pip install "texas-grocery-mcp[browser] @ git+https://github.com/nick-pape/texas-grocery-mcp.git"
+pip install "texas-grocery-mcp[browser] @ git+https://github.com/Haub100/texas-grocery-mcp.git"
 playwright install chromium
 ```
 
@@ -230,7 +230,7 @@ Agent uses: session_save_credentials(email="you@email.com", password="...")
 
 ```bash
 # Clone repository
-git clone https://github.com/nick-pape/texas-grocery-mcp
+git clone https://github.com/Haub100/texas-grocery-mcp
 cd texas-grocery-mcp
 
 # Install with dev dependencies

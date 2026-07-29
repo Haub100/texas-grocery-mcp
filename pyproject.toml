@@ -51,10 +51,10 @@ dev = [
 texas-grocery-mcp = "texas_grocery_mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/mgwalkerjr95/texas-grocery-mcp"
-Repository = "https://github.com/mgwalkerjr95/texas-grocery-mcp"
-Issues = "https://github.com/mgwalkerjr95/texas-grocery-mcp/issues"
-Changelog = "https://github.com/mgwalkerjr95/texas-grocery-mcp/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/Haub100/texas-grocery-mcp"
+Repository = "https://github.com/Haub100/texas-grocery-mcp"
+Issues = "https://github.com/Haub100/texas-grocery-mcp/issues"
+Changelog = "https://github.com/Haub100/texas-grocery-mcp/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
