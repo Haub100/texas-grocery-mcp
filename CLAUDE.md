@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 An MCP server (`fastmcp`) that lets an LLM shop H-E-B groceries: search products, manage cart, clip coupons, check curbside pickup slots and order history. It talks to HEB's unofficial GraphQL/Next.js APIs — there's no official public API, so most of the interesting code deals with authentication and anti-bot evasion, not grocery logic.
 
-This is a maintained fork of `mgwalkerjr95/texas-grocery-mcp`; upstream is unmaintained. Package/repo metadata still points at the old owner in places (`pyproject.toml` URLs) — don't "fix" that without being asked.
+This is a maintained fork of `mgwalkerjr95/texas-grocery-mcp` (via `nick-pape/texas-grocery-mcp`); both upstreams are unmaintained. All repo metadata and links now point at `Haub100/texas-grocery-mcp` — keep it that way. There is deliberately no `upstream` git remote, and `gh` is pinned to this fork via `remote.origin.gh-resolved`, so PRs never target a parent repo by accident; don't re-add an upstream remote. The fork attribution in `README.md` and the historical release links in `CHANGELOG.md` are intentional and should stay.
 
 ## Commands
 
