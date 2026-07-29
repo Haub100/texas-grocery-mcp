@@ -192,3 +192,42 @@ async def test_self_heal_with_client_variant(client, reset_persisted_queries):
     assert result == {"cart": {"itemCount": 5}}
     assert reset_persisted_queries["cartEstimated"] == "FRESH_HASH"
     assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_self_heal_mutation_flow_variant(client):
+    """deleteShoppingListItems is registered in MUTATION_FLOWS, so a stale
+    hash routes through discover_mutation_hash (active click-flow capture),
+    not the passive rediscover_hashes sweep used by query-type ops."""
+    import httpx
+
+    fresh = HashStore(
+        defaults={"deleteShoppingListItems": "STALE_HASH"},
+        cache_path=None,
+    )
+    original = gql_module.PERSISTED_QUERIES
+    gql_module.PERSISTED_QUERIES = fresh
+    try:
+        route = respx.post("https://www.heb.com/graphql").mock(
+            side_effect=[
+                _stale_response(),
+                _success_response({"deleteShoppingListItemsV2": {"id": "list-1"}}),
+            ]
+        )
+
+        fake_discover = AsyncMock(return_value="FRESH_HASH")
+        with patch(
+            "texas_grocery_mcp.clients.hash_rediscover.discover_mutation_hash", fake_discover
+        ):
+            async with httpx.AsyncClient() as auth_client:
+                result = await client._execute_persisted_query_with_client(
+                    auth_client, "deleteShoppingListItems", {"x": 1}
+                )
+
+        assert result == {"deleteShoppingListItemsV2": {"id": "list-1"}}
+        assert fresh["deleteShoppingListItems"] == "FRESH_HASH"
+        fake_discover.assert_awaited_once()
+        assert route.call_count == 2
+    finally:
+        gql_module.PERSISTED_QUERIES = original

@@ -85,6 +85,34 @@ def test_mutation_flows_contains_select_pickup_fulfillment():
     assert callable(flow)
 
 
+def test_shopping_list_query_ops_have_dedicated_pages():
+    """getShoppingListsV2/getShoppingListV2 both fire passively on
+    /shopping-list, so they don't need a MUTATION_FLOWS click script."""
+    for op in ("getShoppingListsV2", "getShoppingListV2"):
+        assert op in OPERATION_PAGES, f"{op} missing from OPERATION_PAGES"
+        assert "https://www.heb.com/shopping-list" in OPERATION_PAGES[op]
+
+
+def test_mutation_flows_contains_shopping_list_mutations():
+    """create/add-item/remove-item/delete-list all need active click flows
+    (mobile hashes for these turned out to be stale with no self-heal
+    fallback, so the web path here is the one that actually works)."""
+    from texas_grocery_mcp.clients.hash_rediscover import MUTATION_FLOWS
+
+    shopping_list_ops = (
+        "createShoppingList",
+        "addToShoppingListV2",
+        "deleteShoppingListItems",
+        "deleteShoppingLists",
+    )
+    for op in shopping_list_ops:
+        assert op in MUTATION_FLOWS, f"{op} missing from MUTATION_FLOWS"
+        assert callable(MUTATION_FLOWS[op])
+    # All four share one self-cleaning round-trip flow function.
+    flows = {MUTATION_FLOWS[op] for op in shopping_list_ops}
+    assert len(flows) == 1, "expected all four ops to share the same cleanup flow"
+
+
 async def test_discover_mutation_hash_unknown_op_raises():
     """Unknown operation_name is a programming error, not silent return."""
     import pytest

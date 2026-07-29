@@ -35,6 +35,15 @@ from texas_grocery_mcp.tools.session import (
     session_save_instructions,
     session_status,
 )
+from texas_grocery_mcp.tools.shopping_list import (
+    shopping_list_add_item,
+    shopping_list_add_to_cart,
+    shopping_list_create,
+    shopping_list_delete,
+    shopping_list_get,
+    shopping_list_list,
+    shopping_list_remove_item,
+)
 from texas_grocery_mcp.tools.store import (
     store_change,
     store_get_default,
@@ -302,6 +311,15 @@ mcp.tool(annotations={"destructiveHint": True})(cart_add)
 mcp.tool(annotations={"destructiveHint": True})(cart_add_many)
 mcp.tool(annotations={"destructiveHint": True})(cart_add_with_retry)
 mcp.tool(annotations={"destructiveHint": True})(cart_remove)
+
+# Register shopping list tools
+mcp.tool(annotations={"readOnlyHint": True})(shopping_list_list)
+mcp.tool(annotations={"readOnlyHint": True})(shopping_list_get)
+mcp.tool(annotations={"destructiveHint": True})(shopping_list_create)
+mcp.tool(annotations={"destructiveHint": True})(shopping_list_add_item)
+mcp.tool(annotations={"destructiveHint": True})(shopping_list_remove_item)
+mcp.tool(annotations={"destructiveHint": True})(shopping_list_delete)
+mcp.tool(annotations={"destructiveHint": True})(shopping_list_add_to_cart)
 
 # Register session tools
 mcp.tool(annotations={"readOnlyHint": True})(session_status)

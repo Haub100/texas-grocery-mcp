@@ -26,6 +26,10 @@ from texas_grocery_mcp.models import (
     ProductSearchAttempt,
     ProductSearchResult,
     SearchAttempt,
+    ShoppingListDetail,
+    ShoppingListItem,
+    ShoppingListsResult,
+    ShoppingListSummary,
     Store,
     StoreSearchResult,
 )
@@ -72,6 +76,15 @@ DEFAULT_PERSISTED_QUERIES = {
     "CouponClip": "88b18ac22cee98372428d9a91d759ffb5e919026ee61c747f9f88d11336b846b",
     # Store change mutation - changes the active pickup store
     "SelectPickupFulfillment": "8fa3c683ee37ad1bab9ce22b99bd34315b2a89cfc56208d63ba9efc0c49a6323",
+    # Shopping list operations (web/cookie path; mobile hashes for these were
+    # tried and found stale — see MOBILE_OPS comment below). All live-verified
+    # 2026-07-28.
+    "getShoppingListsV2": "35da893a3476a098d44f8d6ac379db3129117b977d4df4dcbe48a5641eb9fdd5",
+    "getShoppingListV2": "be7ef9cbde1681126eb189e3a362aef969794a7e3dc7bbd046ff6a9adb1dadad",
+    "createShoppingList": "e79d5dcdfc241ae8692f04c8776611f1c720a4c79f57ebc35519eb22ace0d5db",
+    "addToShoppingListV2": "39076b06f05b5427a458e1a35f4946e63c021df56a40556bc8eee23ba4100c5a",
+    "deleteShoppingListItems": "be69093d13eec3d8297cfa6be524fde8bc2d4e4917249574ff1b8159efa61019",
+    "deleteShoppingLists": "125a26fb3ed610be66097258eb2c497d00d519d9f36baa149ed8ad6d49ccef8a",
 }
 
 
@@ -115,6 +128,12 @@ MOBILE_OPS: dict[str, tuple[str, str]] = {
         "orderDetails",
         "bd1ba9beb2e4af8a4099965d1b4ce455d28532e8b727d490f3a7df6486d5508f",
     ),
+    # Note: shopping-list ops (getShoppingListsV2, createShoppingList,
+    # addToShoppingListV2) were evaluated for this mobile path too, but the
+    # hashes from iHildy/heb-sdk-unofficial all returned PersistedQueryNotFound
+    # on live testing (2026-07-28) and mobile hashes have no self-heal to
+    # recover from that — see DEFAULT_PERSISTED_QUERIES for the web/self-heal
+    # path those operations use instead.
 }
 # Shopping context used for mobile/bearer pricing + availability.
 MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
@@ -2998,6 +3017,276 @@ class HEBGraphQLClient:
                 total=0,
                 categories=[],
             )
+
+    # ========================================================================
+    # Shopping List Methods
+    # ========================================================================
+    #
+    # All six operations go through the web/cookie persisted-query path with
+    # full self-heal (HashStore + MUTATION_FLOWS/OPERATION_PAGES in
+    # hash_rediscover.py), same as CouponClip/SelectPickupFulfillment. HEB's
+    # mobile API was evaluated for list/create/add-item (durable hashes would
+    # mean no self-heal needed, like cartItemV2 etc.) but the mobile hashes
+    # from iHildy/heb-sdk-unofficial all returned PersistedQueryNotFound on
+    # live testing (2026-07-28) — apparently captured from a stale MyHEB app
+    # build — and mobile hashes have no self-heal mechanism to recover from
+    # that. The web path is what's actually verified working.
+
+    async def get_shopping_lists(self) -> ShoppingListsResult:
+        """List all of the user's HEB shopping lists (web/cookie, self-heals).
+
+        Returns:
+            ShoppingListsResult with list summaries, or empty on auth failure.
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            logger.warning("Shopping lists require an authenticated web session")
+            return ShoppingListsResult(lists=[], total=0)
+
+        data = await self._execute_persisted_query_with_client(
+            auth_client, "getShoppingListsV2", {}
+        )
+        lists_data = data.get("getShoppingListsV2", {})
+        summaries = []
+        for lst in lists_data.get("lists", []):
+            store = lst.get("fulfillment", {}).get("store", {})
+            summaries.append(
+                ShoppingListSummary(
+                    id=lst["id"],
+                    name=lst["name"],
+                    total_item_count=lst.get("totalItemCount", 0),
+                    store_number=(
+                        str(store["storeNumber"]) if store.get("storeNumber") else None
+                    ),
+                    store_name=store.get("name"),
+                    updated=lst.get("updated"),
+                )
+            )
+        total = lists_data.get("thisPage", {}).get("totalCount", len(summaries))
+        return ShoppingListsResult(lists=summaries, total=total)
+
+    async def get_shopping_list(
+        self,
+        list_id: str,
+        page: int = 0,
+        size: int = 500,
+    ) -> ShoppingListDetail | None:
+        """Get the full contents of a single shopping list (web/cookie, self-heals).
+
+        Args:
+            list_id: The shopping list UUID
+            page: Page number for item pagination (default 0)
+            size: Items per page (default 500)
+
+        Returns:
+            ShoppingListDetail, or None if not found/not authenticated.
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            logger.warning("Shopping list detail requires an authenticated web session")
+            return None
+
+        data = await self._execute_persisted_query_with_client(
+            auth_client,
+            "getShoppingListV2",
+            {
+                "input": {
+                    "id": list_id,
+                    "page": {
+                        "page": page,
+                        "size": size,
+                        "sort": "CATEGORY",
+                        "sortDirection": "ASC",
+                    },
+                }
+            },
+        )
+        sl = data.get("getShoppingListV2")
+        if not sl:
+            return None
+
+        items = []
+        for item in sl.get("itemPage", {}).get("items", []):
+            product = item.get("product", {})
+            skus = product.get("SKUs", [])
+            sku = skus[0] if skus else {}
+            price = item.get("itemPrice", {})
+            items.append(
+                ShoppingListItem(
+                    item_id=item["id"],
+                    product_id=product.get("id"),
+                    sku_id=sku.get("id"),
+                    name=product.get("fullDisplayName"),
+                    brand=product.get("brand", {}).get("name"),
+                    size=sku.get("customerFriendlySize"),
+                    quantity=item.get("quantity"),
+                    category=item.get("groupHeader"),
+                    checked=item.get("checked"),
+                    note=item.get("note"),
+                    price=price.get("listPrice"),
+                    total_price=price.get("totalAmount"),
+                    on_sale=price.get("onSale", False),
+                    in_stock=product.get("inventory", {}).get("inventoryState") == "IN_STOCK",
+                    aisle=product.get("productLocation", {}).get("location"),
+                )
+            )
+
+        return ShoppingListDetail(
+            id=sl["id"],
+            name=sl["name"],
+            total_item_count=sl.get("totalItemCount", 0),
+            total_price=sl.get("total", {}).get("formattedPrice"),
+            items=items,
+        )
+
+    async def create_shopping_list(self, name: str, store_id: str) -> dict[str, Any]:
+        """Create a new HEB shopping list (web/cookie, self-heals).
+
+        Args:
+            name: Name for the new list
+            store_id: HEB store number to associate with the list
+
+        Returns:
+            Result dict with the new list's id/name, or an error dict.
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Login required to create shopping lists",
+            }
+
+        data = await self._execute_persisted_query_with_client(
+            auth_client,
+            "createShoppingList",
+            {"input": {"name": name, "storeId": str(store_id)}},
+        )
+        result = data.get("createShoppingListV2", {})
+        if not result:
+            return {
+                "error": True,
+                "code": "CREATE_FAILED",
+                "message": "Failed to create shopping list",
+            }
+        return {"success": True, "id": result["id"], "name": result["name"]}
+
+    async def add_to_shopping_list(
+        self, list_id: str, product_ids: list[str]
+    ) -> dict[str, Any]:
+        """Add products to an HEB shopping list (web/cookie, self-heals).
+
+        Args:
+            list_id: The shopping list UUID
+            product_ids: Product IDs to add
+
+        Returns:
+            Result dict with the list's updated item count/total, or an error dict.
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Login required to modify shopping lists",
+            }
+
+        list_items = [{"item": {"productId": pid}} for pid in product_ids]
+        data = await self._execute_persisted_query_with_client(
+            auth_client,
+            "addToShoppingListV2",
+            {
+                "input": {
+                    "listId": list_id,
+                    "listItems": list_items,
+                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+        result = data.get("addShoppingListItemsV2", {})
+        if not result:
+            return {
+                "error": True,
+                "code": "ADD_FAILED",
+                "message": "Failed to add items to shopping list",
+            }
+        return {
+            "success": True,
+            "list_id": result["id"],
+            "name": result["name"],
+            "total_item_count": result.get("totalItemCount", 0),
+            "total_price": result.get("total", {}).get("formattedPrice"),
+        }
+
+    async def remove_from_shopping_list(
+        self, list_id: str, item_ids: list[str]
+    ) -> dict[str, Any]:
+        """Remove items from an HEB shopping list (web/cookie, self-heals).
+
+        Args:
+            list_id: The shopping list UUID
+            item_ids: Item IDs to remove (from get_shopping_list, not product IDs)
+
+        Returns:
+            Result dict with the list's updated item count/total, or an error dict.
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Login required to modify shopping lists",
+            }
+
+        data = await self._execute_persisted_query_with_client(
+            auth_client,
+            "deleteShoppingListItems",
+            {
+                "input": {
+                    "itemIds": item_ids,
+                    "listId": list_id,
+                    "page": {"sort": "CATEGORY", "sortDirection": "ASC"},
+                }
+            },
+        )
+        result = data.get("deleteShoppingListItemsV2", {})
+        if not result:
+            return {
+                "error": True,
+                "code": "REMOVE_FAILED",
+                "message": "Failed to remove items from shopping list",
+            }
+        return {
+            "success": True,
+            "list_id": result["id"],
+            "name": result["name"],
+            "total_item_count": result.get("totalItemCount", 0),
+            "total_price": result.get("total", {}).get("formattedPrice"),
+        }
+
+    async def delete_shopping_list(self, list_id: str) -> dict[str, Any]:
+        """Delete an entire HEB shopping list (web/cookie, self-heals).
+
+        Args:
+            list_id: The shopping list UUID to delete
+
+        Returns:
+            Result dict with success status, or an error dict.
+        """
+        auth_client = await self._get_authenticated_client()
+        if not auth_client:
+            return {
+                "error": True,
+                "code": "NOT_AUTHENTICATED",
+                "message": "Login required to delete shopping lists",
+            }
+
+        await self._execute_persisted_query_with_client(
+            auth_client,
+            "deleteShoppingLists",
+            {"input": {"ids": [list_id]}},
+        )
+        return {"success": True, "list_id": list_id}
 
     async def select_store(self, store_id: str, ignore_conflicts: bool = False) -> dict[str, Any]:
         """Change the active store via GraphQL mutation with verification.
