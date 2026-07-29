@@ -303,3 +303,73 @@ async def test_shopping_list_bearer_token_failure_is_auth_error(client, monkeypa
 
     assert result["error"] is True
     assert result["code"] == "NOT_AUTHENTICATED"
+
+
+# ---------------------------------------------------------------------------
+# Persisted-query miss retry on the bearer path
+# ---------------------------------------------------------------------------
+
+
+def _pq_miss() -> dict:
+    return {
+        "errors": [
+            {
+                "message": "PersistedQueryNotFound",
+                "extensions": {"code": "PERSISTED_QUERY_NOT_FOUND"},
+            }
+        ]
+    }
+
+
+def _bearer_http(client, monkeypatch, responses: list[dict]) -> AsyncMock:
+    """Drive _execute_bearer_query against a scripted sequence of HTTP bodies."""
+    post = AsyncMock(
+        side_effect=[
+            MagicMock(json=MagicMock(return_value=body), raise_for_status=MagicMock())
+            for body in responses
+        ]
+    )
+    monkeypatch.setattr(client, "_get_bearer_client", AsyncMock(return_value=MagicMock(post=post)))
+    monkeypatch.setattr(
+        "texas_grocery_mcp.auth.oauth.ensure_access_token", lambda _dir: "token-abc"
+    )
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    return post
+
+
+@pytest.mark.asyncio
+async def test_bearer_retries_persisted_query_miss(client, monkeypatch):
+    """A hash miss should resolve itself without the caller invoking the tool twice."""
+    post = _bearer_http(
+        client,
+        monkeypatch,
+        [_pq_miss(), {"data": {"getShoppingListsV2": {"lists": [], "thisPage": {}}}}],
+    )
+    result = await client._execute_bearer_query("getShoppingListsV2", {"page": {}})
+
+    assert post.await_count == 2
+    assert result == {"getShoppingListsV2": {"lists": [], "thisPage": {}}}
+
+
+@pytest.mark.asyncio
+async def test_bearer_gives_up_after_max_attempts(client, monkeypatch):
+    """A genuinely rotated hash never recovers — fail rather than retry forever."""
+    from texas_grocery_mcp.clients.graphql import MOBILE_PQ_MAX_ATTEMPTS, GraphQLError
+
+    post = _bearer_http(client, monkeypatch, [_pq_miss()] * MOBILE_PQ_MAX_ATTEMPTS)
+    with pytest.raises(GraphQLError):
+        await client._execute_bearer_query("getShoppingListsV2", {"page": {}})
+
+    assert post.await_count == MOBILE_PQ_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_bearer_does_not_retry_other_graphql_errors(client, monkeypatch):
+    """Only hash misses are safe to replay; a real error must surface immediately."""
+    from texas_grocery_mcp.clients.graphql import GraphQLError
+
+    post = _bearer_http(client, monkeypatch, [{"errors": [{"message": "Item not found"}]}])
+    with pytest.raises(GraphQLError):
+        await client._execute_bearer_query("deleteShoppingLists", {"input": {"ids": ["x"]}})
+
+    assert post.await_count == 1

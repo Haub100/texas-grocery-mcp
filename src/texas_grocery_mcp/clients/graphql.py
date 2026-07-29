@@ -164,6 +164,26 @@ MOBILE_OPS: dict[str, tuple[str, str]] = {
 MOBILE_API_KEY = "l7xx3545d7490b224976a1ce681a69423ea6"
 # Mobile list ops sort by physical store layout rather than the web's CATEGORY.
 MOBILE_LIST_SORT = "STORE_LOCATION"
+# A PersistedQueryNotFound from the mobile edge is often transient (see
+# _execute_bearer_query), so retry a couple of times before giving up. Kept small:
+# a genuinely rotated hash will never recover, and burning attempts just delays the
+# error the caller needs to see.
+MOBILE_PQ_MAX_ATTEMPTS = 3
+MOBILE_PQ_RETRY_DELAY = 0.5
+
+
+def _is_persisted_query_miss(errors: Any) -> bool:
+    """True if a GraphQL error list is a persisted-query hash miss."""
+    if not isinstance(errors, list):
+        return False
+    return any(
+        isinstance(e, dict)
+        and (
+            "PersistedQueryNotFound" in str(e.get("message", ""))
+            or (e.get("extensions") or {}).get("code") == "PERSISTED_QUERY_NOT_FOUND"
+        )
+        for e in errors
+    )
 # Shopping context used for mobile/bearer pricing + availability.
 MOBILE_SHOPPING_CONTEXT = "CURBSIDE_PICKUP"
 
@@ -2193,36 +2213,57 @@ class HEBGraphQLClient:
         client = await self._get_bearer_client()
         self.circuit_breaker.check()
         try:
-            resp = await client.post(
-                MOBILE_GRAPHQL_ENDPOINT,
-                json=payload,
-                headers={
-                    "authorization": f"Bearer {token}",
-                    "content-type": "application/json",
-                    "user-agent": MOBILE_USER_AGENT,
-                    "apikey": MOBILE_API_KEY,
-                    "x-apollo-operation-name": mobile_op,
-                },
-            )
-            resp.raise_for_status()
-            data: Any = resp.json()
-            if isinstance(data, dict) and data.get("errors"):
-                errors = data["errors"]
-                # Mobile hashes are hardcoded with no self-heal (unlike the web
-                # path's HashStore/rediscovery), so a rotated hash would otherwise
-                # surface as an opaque GraphQLError. Name it explicitly — recovery
-                # means re-capturing from live MyHEB traffic. See MOBILE_OPS.
-                if any(
-                    isinstance(e, dict) and "PersistedQueryNotFound" in str(e.get("message", ""))
-                    for e in errors
-                ):
-                    logger.error(
-                        "mobile persisted-query hash rejected — hash likely rotated; "
-                        "re-capture from live MyHEB app traffic",
+            for attempt in range(1, MOBILE_PQ_MAX_ATTEMPTS + 1):
+                resp = await client.post(
+                    MOBILE_GRAPHQL_ENDPOINT,
+                    json=payload,
+                    headers={
+                        "authorization": f"Bearer {token}",
+                        "content-type": "application/json",
+                        "user-agent": MOBILE_USER_AGENT,
+                        "apikey": MOBILE_API_KEY,
+                        "x-apollo-operation-name": mobile_op,
+                    },
+                )
+                resp.raise_for_status()
+                data: Any = resp.json()
+                errors = data.get("errors") if isinstance(data, dict) else None
+                if not errors:
+                    break
+
+                if not _is_persisted_query_miss(errors):
+                    raise GraphQLError(errors)
+
+                # A hash miss means the edge rejected the request *before executing
+                # it*, so retrying is safe even for mutations — no risk of adding an
+                # item or deleting a list twice. Observed live: the MyHEB app itself
+                # gets a miss and the immediate resend succeeds on the same hash.
+                # That is consistent with either a per-node APQ cache on a
+                # load-balanced edge (a retry lands on a warm node) or with Apollo
+                # APQ auto-registration; we can't tell which from traffic capture
+                # alone, and a bounded retry is the cheap fix for the first case.
+                # If retries are consistently exhausted, the hash is genuinely
+                # rotated — mobile hashes have no self-heal (unlike the web path's
+                # HashStore/rediscovery), so recovery means re-capturing from live
+                # MyHEB app traffic. See MOBILE_OPS.
+                if attempt < MOBILE_PQ_MAX_ATTEMPTS:
+                    logger.warning(
+                        "mobile persisted-query hash miss — retrying",
                         operation=mobile_op,
-                        web_operation=web_operation,
-                        sha256_hash=mobile_hash,
+                        attempt=attempt,
+                        max_attempts=MOBILE_PQ_MAX_ATTEMPTS,
                     )
+                    await asyncio.sleep(MOBILE_PQ_RETRY_DELAY * attempt)
+                    continue
+
+                logger.error(
+                    "mobile persisted-query hash rejected after retries — hash likely "
+                    "rotated; re-capture from live MyHEB app traffic",
+                    operation=mobile_op,
+                    web_operation=web_operation,
+                    sha256_hash=mobile_hash,
+                    attempts=attempt,
+                )
                 raise GraphQLError(errors)
             self.circuit_breaker.record_success()
             payload_data = data.get("data") if isinstance(data, dict) else None
